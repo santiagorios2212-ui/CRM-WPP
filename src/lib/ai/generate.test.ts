@@ -73,6 +73,48 @@ describe('generateReply — OpenAI', () => {
     const [url, opts] = fetchMock.mock.calls[0]
     expect(url).toContain('api.openai.com')
     expect(opts.headers.Authorization).toBe('Bearer sk-test')
+    expect(JSON.parse(opts.body).temperature).toBe(0.2)
+  })
+
+  it('retries without temperature when the model rejects it', async () => {
+    // gpt-5 / o-series: "Unsupported value: 'temperature' does not
+    // support 0.2 with this model."
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        errResponse(400, {
+          error: { message: "Unsupported value: 'temperature' does not support 0.2" },
+        }),
+      )
+      .mockResolvedValueOnce(okResponse({ choices: [{ message: { content: 'ok' } }] }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const res = await generateReply({
+      config: config({ provider: 'openai', model: 'gpt-5.4-mini' }),
+      systemPrompt: 'sys',
+      messages: [{ role: 'user', content: 'Hi' }],
+    })
+
+    expect(res.text).toBe('ok')
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toHaveProperty('temperature')
+    expect(JSON.parse(fetchMock.mock.calls[1][1].body)).not.toHaveProperty('temperature')
+  })
+
+  it('does not retry a 400 that is unrelated to temperature', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(errResponse(400, { error: { message: 'model not found' } }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(
+      generateReply({
+        config: config({ provider: 'openai' }),
+        systemPrompt: 'sys',
+        messages: [{ role: 'user', content: 'Hi' }],
+      }),
+    ).rejects.toMatchObject({ code: 'provider_error' })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
   })
 
   it('maps a 401 to an invalid_key AiError', async () => {

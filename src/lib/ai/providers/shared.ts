@@ -10,6 +10,9 @@ export interface ProviderArgs {
   systemPrompt: string
   messages: ChatMessage[]
   timeoutMs: number
+  /** Sampling temperature (see `aiTemperature`). Adapters may drop it
+   *  when the target model refuses anything but its own default. */
+  temperature: number
 }
 
 /** Map a fetch rejection (timeout / DNS / offline) to a typed AiError. */
@@ -45,14 +48,20 @@ export async function providerHttpError(
   }
 
   const { status } = res
-  const code =
-    status === 401 || status === 403
+  // OpenAI's gpt-5 / o-series reject any `temperature` but their own
+  // default with a 400 whose body names the parameter. Give that its own
+  // code so the adapter can retry without it instead of failing the call.
+  const temperatureRejected = status === 400 && /temperature/i.test(detail)
+  const code = temperatureRejected
+    ? 'temperature_unsupported'
+    : status === 401 || status === 403
       ? 'invalid_key'
       : status === 429
         ? 'rate_limited'
         : 'provider_error'
-  const base =
-    code === 'invalid_key'
+  const base = temperatureRejected
+    ? `${provider} does not support a custom temperature`
+    : code === 'invalid_key'
       ? `${provider} rejected the API key`
       : code === 'rate_limited'
         ? `${provider} rate limit reached`

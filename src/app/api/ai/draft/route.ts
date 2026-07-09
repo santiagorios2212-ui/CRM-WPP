@@ -6,7 +6,7 @@ import { buildConversationContext } from '@/lib/ai/context'
 import { retrieveKnowledge } from '@/lib/ai/knowledge'
 import { generateReply } from '@/lib/ai/generate'
 import { buildSystemPrompt } from '@/lib/ai/defaults'
-import { latestUserMessage } from '@/lib/ai/query'
+import { latestUserMessage, recentUserMessages } from '@/lib/ai/query'
 import { AiError } from '@/lib/ai/types'
 
 /**
@@ -88,18 +88,20 @@ export async function POST(request: Request) {
     }
 
     // Ground the draft in the account's knowledge base (best-effort —
-    // returns [] when there's no KB or retrieval fails).
-    const knowledge = await retrieveKnowledge(
-      supabase,
-      accountId,
-      config,
-      latestUserMessage(messages),
-    )
+    // empty when there's no KB or retrieval fails). Unlike auto-reply we
+    // still draft on a degraded retrieval: an agent reads and edits this
+    // before it goes anywhere, and an empty composer helps nobody.
+    const knowledge = await retrieveKnowledge(supabase, accountId, config, {
+      semantic: recentUserMessages(messages),
+      lexical: latestUserMessage(messages),
+    })
 
     const systemPrompt = buildSystemPrompt({
       userPrompt: config.systemPrompt,
       mode: 'draft',
-      knowledge,
+      knowledge: knowledge.excerpts,
+      knowledgeMissing:
+        knowledge.hasKnowledgeBase && knowledge.excerpts.length === 0,
     })
 
     const { text } = await generateReply({ config, systemPrompt, messages })

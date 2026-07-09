@@ -13,13 +13,11 @@ interface OpenAiResponse {
   choices?: { message?: { content?: string } }[]
 }
 
-/**
- * Call OpenAI's Chat Completions endpoint with the caller's own key.
- * Returns the raw assistant text (handoff parsing happens in
- * `generateReply`).
- */
-export async function generateOpenAi(args: ProviderArgs): Promise<string> {
-  const { apiKey, model, systemPrompt, messages, timeoutMs } = args
+async function callOpenAi(
+  args: ProviderArgs,
+  withTemperature: boolean,
+): Promise<string> {
+  const { apiKey, model, systemPrompt, messages, timeoutMs, temperature } = args
 
   let res: Response
   try {
@@ -36,6 +34,7 @@ export async function generateOpenAi(args: ProviderArgs): Promise<string> {
           ...mergeConsecutive(messages),
         ],
         max_completion_tokens: MAX_OUTPUT_TOKENS,
+        ...(withTemperature ? { temperature } : {}),
       }),
       signal: AbortSignal.timeout(timeoutMs),
     })
@@ -55,4 +54,29 @@ export async function generateOpenAi(args: ProviderArgs): Promise<string> {
     })
   }
   return text
+}
+
+/**
+ * Call OpenAI's Chat Completions endpoint with the caller's own key.
+ * Returns the raw assistant text (handoff parsing happens in
+ * `generateReply`).
+ *
+ * `temperature` is sent optimistically. The gpt-5 and o-series models
+ * are governed reasoning systems that expose no sampling knob and answer
+ * a custom temperature with `400 Unsupported value: 'temperature'`; the
+ * account's model is free text, so we can't tell from the id which family
+ * it belongs to. Rather than maintain a brittle prefix allow-list that
+ * rots with every release, we let the provider decide and retry once
+ * without the parameter. Worst case for those models: one wasted
+ * round-trip (they reject before generating, so no tokens are billed).
+ */
+export async function generateOpenAi(args: ProviderArgs): Promise<string> {
+  try {
+    return await callOpenAi(args, true)
+  } catch (err) {
+    if (err instanceof AiError && err.code === 'temperature_unsupported') {
+      return await callOpenAi(args, false)
+    }
+    throw err
+  }
 }
