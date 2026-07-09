@@ -30,6 +30,16 @@ export default function LoginPage() {
   );
 }
 
+/** Why `/auth/callback` bounced someone here. An emailed link that
+ *  quietly dumps the user on a blank sign-in form teaches them nothing;
+ *  these say what went wrong and what to do about it. */
+const CALLBACK_ERRORS: Record<string, string> = {
+  link_expired:
+    "That link has expired or was already used. Request a new one below.",
+  link_invalid:
+    "That link is not valid. Open it in the same browser you requested it from.",
+};
+
 function LoginPageInner() {
   const searchParams = useSearchParams();
   // Forwarded from `/join/<token>` when the visitor already has an
@@ -40,7 +50,9 @@ function LoginPageInner() {
 
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(
+    CALLBACK_ERRORS[searchParams.get("error") ?? ""] ?? null,
+  );
   const [loading, setLoading] = useState(false);
   const router = useRouter();
   const supabase = createClient();
