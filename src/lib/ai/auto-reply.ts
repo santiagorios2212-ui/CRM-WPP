@@ -6,7 +6,11 @@ import { containsMonetaryAmount } from './guards'
 import { retrieveKnowledge } from './knowledge'
 import { hasUnreadableCustomerBurst } from './media'
 import { generateReply } from './generate'
-import { aiBlockMonetaryReplies, buildSystemPrompt } from './defaults'
+import {
+  aiBlockMonetaryReplies,
+  aiHandoffMessage,
+  buildSystemPrompt,
+} from './defaults'
 import { latestUserMessage, recentUserMessages } from './query'
 import { engineSendText } from '@/lib/flows/meta-send'
 
@@ -21,19 +25,64 @@ interface DispatchArgs {
 }
 
 /**
- * Stop auto-replying on this thread and leave the inbound unanswered so
- * it surfaces in the inbox for a human. Sticky until an admin re-enables.
+ * Stop auto-replying on this thread so the inbound surfaces in the inbox
+ * for a human. Sticky until an admin re-enables.
+ *
+ * When `AI_HANDOFF_MESSAGE` is set, the customer is told before the thread
+ * goes quiet. Without it a handoff is silent, and from the customer's side
+ * indistinguishable from being ignored — if the team takes twenty minutes
+ * to look at the inbox, that lead is gone.
+ *
+ * The flag flip doubles as the lock: only the caller that moves
+ * `ai_autoreply_disabled` false → true sends the notice, so two inbounds
+ * landing together can't both message the customer. The claim happens
+ * before the send, so a failed send leaves the thread disabled and quiet
+ * rather than risking a duplicate — under-notify, never double-notify.
+ *
+ * The notice deliberately does NOT consume a `claim_ai_reply_slot` cap
+ * slot: it can only ever be sent once (the thread is disabled by the same
+ * UPDATE that authorises it), so it can't loop, and it shouldn't spend a
+ * reply the human may still want.
  */
 async function handOffToHuman(
   db: SupabaseClient,
-  conversationId: string,
+  args: DispatchArgs,
   reason: string,
 ): Promise<void> {
-  console.info(`[ai auto-reply] handing off ${conversationId}: ${reason}`)
-  await db
+  const { accountId, conversationId, contactId, configOwnerUserId } = args
+
+  const { data: claimed, error } = await db
     .from('conversations')
     .update({ ai_autoreply_disabled: true })
     .eq('id', conversationId)
+    .eq('ai_autoreply_disabled', false)
+    .select('id')
+    .maybeSingle()
+
+  if (error) {
+    console.error('[ai auto-reply] failed to disable auto-reply:', error)
+    return
+  }
+  console.info(`[ai auto-reply] handing off ${conversationId}: ${reason}`)
+  if (!claimed) return // another inbound already handed this thread off
+
+  const message = aiHandoffMessage()
+  if (!message) return
+
+  try {
+    await engineSendText({
+      accountId,
+      userId: configOwnerUserId,
+      conversationId,
+      contactId,
+      text: message,
+    })
+  } catch (err) {
+    // The thread is already disabled — the handoff itself succeeded. Losing
+    // the courtesy notice is a worse customer experience, not a correctness
+    // bug, so log and move on.
+    console.error('[ai auto-reply] handoff notice failed to send:', err)
+  }
 }
 
 /**
@@ -111,7 +160,7 @@ export async function dispatchInboundToAiReply(
     // an image / audio / document, the transcript we just built has a
     // hole in it and any confident answer is a guess.
     if (await hasUnreadableCustomerBurst(db, conversationId)) {
-      await handOffToHuman(db, conversationId, 'unreadable media in burst')
+      await handOffToHuman(db, args, 'unreadable media in burst')
       return
     }
 
@@ -150,14 +199,14 @@ export async function dispatchInboundToAiReply(
 
     if (handoff || !text) {
       // The model can't (or shouldn't) answer.
-      await handOffToHuman(db, conversationId, 'model requested handoff')
+      await handOffToHuman(db, args, 'model requested handoff')
       return
     }
 
     // Hard policy check on the generated text. The prompt already asks the
     // model not to quote prices; this is what makes it true.
     if (aiBlockMonetaryReplies() && containsMonetaryAmount(text)) {
-      await handOffToHuman(db, conversationId, 'reply quoted a monetary amount')
+      await handOffToHuman(db, args, 'reply quoted a monetary amount')
       return
     }
 
