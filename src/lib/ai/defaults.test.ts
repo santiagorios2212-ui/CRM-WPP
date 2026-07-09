@@ -153,7 +153,7 @@ describe('buildSystemPrompt — scheduling', () => {
       { iso: '2026-07-13T10:00:00-03:00', label: 'lunes 13 de julio a las 10:00' },
       { iso: '2026-07-13T14:00:00-03:00', label: 'lunes 13 de julio a las 14:00' },
     ],
-    more: true,
+    total: 42,
   }
 
   it('forbids promising an invitation when there is no calendar', () => {
@@ -168,7 +168,7 @@ describe('buildSystemPrompt — scheduling', () => {
     const prompt = buildSystemPrompt({
       userPrompt: null,
       mode: 'auto_reply',
-      booking: { suggested: [], more: false },
+      booking: { suggested: [], total: 0 },
     })
     expect(prompt).toContain('no free slots in the bookable window')
     expect(prompt).toMatch(/do not offer to look for one/i)
@@ -190,16 +190,28 @@ describe('buildSystemPrompt — scheduling', () => {
     expect(prompt).toMatch(/nothing has been booked/i)
   })
 
-  it('invites a counter-proposal only when other slots exist', () => {
-    const open = buildSystemPrompt({ userPrompt: null, mode: 'auto_reply', booking: slots })
-    expect(open).toMatch(/if the customer proposes one, go ahead and try to book it/i)
+  it('forbids claiming a day is unavailable while slots are hidden', () => {
+    // The bug: shown three Friday slots, the agent told a real customer
+    // "el lunes no está disponible". Monday was free — it just wasn't in
+    // the list. A short list is a readable message, not a claim about the
+    // diary, and the model has to be told which.
+    const prompt = buildSystemPrompt({ userPrompt: null, mode: 'auto_reply', booking: slots })
+    expect(prompt).toContain('There are 42 free slots')
+    expect(prompt).toContain('the 2 soonest')
+    expect(prompt).toContain('40 other free slots are not shown')
+    expect(prompt).toMatch(/never tell the customer that a day or a time is unavailable/i)
+    expect(prompt).toMatch(/say you can try it/i)
+  })
 
+  it('permits saying a time is taken only when nothing else is free', () => {
     const closed = buildSystemPrompt({
       userPrompt: null,
       mode: 'auto_reply',
-      booking: { ...slots, more: false },
+      booking: { ...slots, total: slots.suggested.length },
     })
-    expect(closed).toContain('These are the only free times')
+    expect(closed).toContain('These are the only free slots')
+    expect(closed).toContain('This is the entire remaining diary')
+    expect(closed).not.toMatch(/never tell the customer that a day or a time is unavailable/i)
   })
 
   it('never teaches a draft to book — a human sends those', () => {
