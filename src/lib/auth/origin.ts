@@ -20,7 +20,18 @@
  */
 export function appOrigin(request: Request): string {
   const explicit = process.env.NEXT_PUBLIC_SITE_URL?.trim()
-  if (explicit) return explicit.replace(/\/+$/, '')
+  if (explicit) {
+    const validated = asHttpOrigin(explicit)
+    if (validated) return validated
+    // Do not propagate. This value is fed straight to `NextResponse
+    // .redirect`, which throws on a malformed URL — a 500 on the auth
+    // callback, from a typo in a dashboard field nobody looks at again.
+    // Someone did paste the variable's *name* into its value box, and it
+    // took a production stack trace to find out.
+    console.error(
+      `[auth] NEXT_PUBLIC_SITE_URL is not an absolute http(s) URL ("${explicit}"); deriving the origin from the request instead.`,
+    )
+  }
 
   const headers = request.headers
   const host = headers.get('x-forwarded-host')?.split(',')[0].trim() || headers.get('host')
@@ -29,6 +40,18 @@ export function appOrigin(request: Request): string {
     (host?.startsWith('localhost') ? 'http' : 'https')
 
   return `${proto}://${host}`
+}
+
+/** `value` as a bare `scheme://host[:port]` origin, or null if it is not
+ *  an absolute http(s) URL. Any path, query, or fragment is discarded. */
+function asHttpOrigin(value: string): string | null {
+  try {
+    const url = new URL(value)
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return null
+    return url.origin
+  } catch {
+    return null
+  }
 }
 
 /**

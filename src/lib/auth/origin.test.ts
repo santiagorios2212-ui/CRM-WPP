@@ -28,6 +28,28 @@ describe('appOrigin', () => {
     vi.stubEnv('NEXT_PUBLIC_SITE_URL', '')
     expect(appOrigin(req({ host: 'localhost:3000' }))).toBe('http://localhost:3000')
   })
+
+  it('ignores a misconfigured site URL rather than 500-ing on redirect', () => {
+    // Really happened: the variable's *name* was pasted into its value
+    // box. The string flows into NextResponse.redirect, which throws on a
+    // malformed URL — taking down the auth callback.
+    vi.stubEnv('NEXT_PUBLIC_SITE_URL', 'NEXT_PUBLIC_SITE_URL')
+    expect(appOrigin(req({ 'x-forwarded-host': 'crm.example.com' }))).toBe(
+      'https://crm.example.com',
+    )
+  })
+
+  it('rejects a non-http scheme', () => {
+    vi.stubEnv('NEXT_PUBLIC_SITE_URL', 'javascript:alert(1)')
+    expect(appOrigin(req({ 'x-forwarded-host': 'crm.example.com' }))).toBe(
+      'https://crm.example.com',
+    )
+  })
+
+  it('strips a path someone appended to the site URL', () => {
+    vi.stubEnv('NEXT_PUBLIC_SITE_URL', 'https://crm.example.com/dashboard')
+    expect(appOrigin(req())).toBe('https://crm.example.com')
+  })
 })
 
 describe('safeNextPath', () => {
