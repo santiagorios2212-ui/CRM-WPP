@@ -5,7 +5,8 @@ import { loadAiConfig } from '@/lib/ai/config'
 import { buildConversationContext } from '@/lib/ai/context'
 import { retrieveKnowledge } from '@/lib/ai/knowledge'
 import { generateReply } from '@/lib/ai/generate'
-import { buildSystemPrompt } from '@/lib/ai/defaults'
+import { aiDefaultTimezone, buildSystemPrompt } from '@/lib/ai/defaults'
+import { loadTimezone } from '@/lib/calendar/config'
 import { latestUserMessage, recentUserMessages } from '@/lib/ai/query'
 import { AiError } from '@/lib/ai/types'
 
@@ -99,9 +100,14 @@ export async function POST(request: Request) {
     const systemPrompt = buildSystemPrompt({
       userPrompt: config.systemPrompt,
       mode: 'draft',
+      now: new Date(),
+      timezone: (await loadTimezone(supabase, accountId)) ?? aiDefaultTimezone(),
       knowledge: knowledge.excerpts,
       knowledgeMissing:
         knowledge.hasKnowledgeBase && knowledge.excerpts.length === 0,
+      // Drafts never schedule: a human reads and sends this, and the
+      // meeting they agree to is one they book themselves.
+      booking: null,
     })
 
     const { text } = await generateReply({ config, systemPrompt, messages })

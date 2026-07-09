@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { DEFAULT_WORKING_HOURS, type CalendarConfig } from '@/lib/calendar/types'
 import type { AiConfig } from './types'
 
 // Shared, hoisted mock state so the module mocks can close over it.
@@ -9,6 +10,10 @@ const h = vi.hoisted(() => ({
   hasUnreadableCustomerBurst: vi.fn(),
   generateReply: vi.fn(),
   engineSendText: vi.fn(),
+  loadCalendarConfig: vi.fn(),
+  loadConfirmationTemplate: vi.fn(),
+  freeSlots: vi.fn(),
+  bookMeeting: vi.fn(),
   state: {
     conv: null as Record<string, unknown> | null,
     autoResponders: [] as { id: string }[],
@@ -17,6 +22,8 @@ const h = vi.hoisted(() => ({
     handoffClaim: true as boolean,
     updatePayload: null as Record<string, unknown> | null,
     rpcCalls: [] as { name: string; args: unknown }[],
+    /** An existing row in `ai_bookings` for this conversation, if any. */
+    existingBooking: null as { id: string } | null,
   },
 }))
 
@@ -28,9 +35,46 @@ vi.mock('./media', () => ({
 }))
 vi.mock('./generate', () => ({ generateReply: h.generateReply }))
 vi.mock('@/lib/flows/meta-send', () => ({ engineSendText: h.engineSendText }))
+
+// Only the IO is stubbed. `suggestedSlots` and `confirmationMessage` are
+// pure, and mocking them would hide the thing worth testing: that the
+// customer is told the time we actually wrote to the calendar.
+vi.mock('@/lib/calendar/config', () => ({
+  loadCalendarConfig: h.loadCalendarConfig,
+  loadConfirmationTemplate: h.loadConfirmationTemplate,
+}))
+vi.mock('@/lib/calendar/availability', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/lib/calendar/availability')>()),
+  freeSlots: h.freeSlots,
+}))
+vi.mock('@/lib/calendar/book', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/lib/calendar/book')>()),
+  bookMeeting: h.bookMeeting,
+}))
+
 vi.mock('./admin-client', () => ({
   supabaseAdmin: () => ({
     from: (table: string) => {
+      if (table === 'ai_bookings') {
+        return {
+          select: () => ({
+            eq: () => ({
+              maybeSingle: () =>
+                Promise.resolve({ data: h.state.existingBooking, error: null }),
+            }),
+          }),
+        }
+      }
+      if (table === 'contacts') {
+        return {
+          select: () => ({
+            eq: () => ({
+              maybeSingle: () =>
+                Promise.resolve({ data: { name: 'Juan Pérez' }, error: null }),
+            }),
+          }),
+        }
+      }
       if (table === 'automations') {
         // .select().eq().eq().in().limit() → active auto-responders
         const chain = {
@@ -111,12 +155,21 @@ beforeEach(() => {
   h.state.handoffClaim = true
   h.state.updatePayload = null
   h.state.rpcCalls = []
+  h.state.existingBooking = null
   h.loadAiConfig.mockResolvedValue(aiConfig())
   h.buildConversationContext.mockResolvedValue([{ role: 'user', content: 'hi' }])
   h.retrieveKnowledge.mockResolvedValue(NO_KB)
   h.hasUnreadableCustomerBurst.mockResolvedValue(false)
   h.generateReply.mockResolvedValue({ text: 'Hello!', handoff: false })
   h.engineSendText.mockResolvedValue({ whatsapp_message_id: 'm1' })
+  // No calendar connected — the common case, and the default everywhere
+  // else in this file.
+  h.loadCalendarConfig.mockResolvedValue(null)
+  h.loadConfirmationTemplate.mockResolvedValue(
+    'Listo, agendé la llamada para el {datetime}. Te envié la invitación a {email}.',
+  )
+  h.freeSlots.mockResolvedValue([])
+  h.bookMeeting.mockResolvedValue({ status: 'failed', error: new Error('unstubbed') })
 })
 
 afterEach(() => {
@@ -394,5 +447,194 @@ describe('dispatchInboundToAiReply — monetary output guard', () => {
     })
     await dispatchInboundToAiReply(ARGS)
     expect(h.engineSendText).toHaveBeenCalled()
+  })
+})
+
+// ============================================================
+// Scheduling.
+//
+// The transcript that prompted this feature: the customer offered
+// "de lunes a viernes de 9 a 17hs", the agent kept asking for a narrower
+// time, and then promised to send a calendar invitation that no code
+// path could ever send. Both halves are tested here.
+// ============================================================
+
+const BA = 'America/Argentina/Buenos_Aires'
+const MONDAY_10 = new Date(Date.UTC(2026, 6, 13, 13, 0)) // 10:00 in BA
+
+function calendarConfig(overrides: Partial<CalendarConfig> = {}): CalendarConfig {
+  return {
+    provider: 'google',
+    refreshToken: 'refresh-token',
+    calendarId: 'primary',
+    connectedEmail: 'santi@allnisa.com',
+    timezone: BA,
+    slotMinutes: 30,
+    bufferMinutes: 15,
+    minNoticeMinutes: 120,
+    maxDaysAhead: 14,
+    offerSlots: 3,
+    workingHours: DEFAULT_WORKING_HOURS,
+    bookingEnabled: true,
+    ...overrides,
+  }
+}
+
+const SLOTS = [
+  { start: MONDAY_10, end: new Date(MONDAY_10.getTime() + 30 * 60_000) },
+  {
+    start: new Date(MONDAY_10.getTime() + 4 * 3_600_000),
+    end: new Date(MONDAY_10.getTime() + 4 * 3_600_000 + 30 * 60_000),
+  },
+]
+
+const MARKER = '[[BOOK|2026-07-13T10:00:00-03:00|juan@example.com]]'
+
+/** The system prompt handed to the model on the last generate call. */
+const lastPrompt = (): string =>
+  h.generateReply.mock.calls.at(-1)![0].systemPrompt as string
+
+describe('dispatchInboundToAiReply — the scheduling prompt', () => {
+  it('always dates the conversation, so "el lunes" is resolvable', async () => {
+    await dispatchInboundToAiReply(ARGS)
+    expect(lastPrompt()).toContain('Current date and time:')
+  })
+
+  it('forbids promising an invitation when no calendar is connected', async () => {
+    await dispatchInboundToAiReply(ARGS)
+    expect(lastPrompt()).toContain('you have no access to a calendar')
+  })
+
+  it('offers real slots when a calendar is connected', async () => {
+    h.loadCalendarConfig.mockResolvedValue(calendarConfig())
+    h.freeSlots.mockResolvedValue(SLOTS)
+    await dispatchInboundToAiReply(ARGS)
+    expect(lastPrompt()).toContain('lunes 13 de julio a las 10:00 → 2026-07-13T10:00:00-03:00')
+  })
+
+  it('says the calendar is full rather than absent when nothing is free', async () => {
+    h.loadCalendarConfig.mockResolvedValue(calendarConfig())
+    h.freeSlots.mockResolvedValue([])
+    await dispatchInboundToAiReply(ARGS)
+    expect(lastPrompt()).toContain('no free slots in the bookable window')
+  })
+
+  it('reads the clock in the calendar timezone even when booking is off', async () => {
+    h.loadCalendarConfig.mockResolvedValue(calendarConfig({ bookingEnabled: false }))
+    await dispatchInboundToAiReply(ARGS)
+    expect(lastPrompt()).toContain(BA)
+    expect(lastPrompt()).toContain('you have no access to a calendar')
+    expect(h.freeSlots).not.toHaveBeenCalled()
+  })
+
+  it('stops offering meetings once the thread has booked one', async () => {
+    h.loadCalendarConfig.mockResolvedValue(calendarConfig())
+    h.state.existingBooking = { id: 'booking-1' }
+    await dispatchInboundToAiReply(ARGS)
+    expect(h.freeSlots).not.toHaveBeenCalled()
+    expect(lastPrompt()).toContain('you have no access to a calendar')
+  })
+
+  it('does not schedule when the calendar cannot be read', async () => {
+    h.loadCalendarConfig.mockResolvedValue(calendarConfig())
+    h.freeSlots.mockRejectedValue(new Error('google is down'))
+    await dispatchInboundToAiReply(ARGS)
+    // Degrades to "no calendar" and still answers the customer's question.
+    expect(lastPrompt()).toContain('you have no access to a calendar')
+    expect(h.engineSendText).toHaveBeenCalledWith(
+      expect.objectContaining({ text: 'Hello!' }),
+    )
+  })
+})
+
+describe('dispatchInboundToAiReply — executing a booking', () => {
+  beforeEach(() => {
+    h.loadCalendarConfig.mockResolvedValue(calendarConfig())
+    h.freeSlots.mockResolvedValue(SLOTS)
+    h.generateReply.mockResolvedValue({ text: MARKER, handoff: false })
+  })
+
+  it('books, then confirms with the time it actually wrote', async () => {
+    h.bookMeeting.mockResolvedValue({
+      status: 'booked',
+      slot: SLOTS[0],
+      result: { eventId: 'evt-1', meetUrl: 'https://meet.google.com/abc' },
+    })
+    await dispatchInboundToAiReply(ARGS)
+
+    expect(h.bookMeeting).toHaveBeenCalledWith(
+      expect.objectContaining({
+        instant: MONDAY_10,
+        attendeeEmail: 'juan@example.com',
+        contactName: 'Juan Pérez',
+      }),
+    )
+    // Composed by code from the booked instant — never by the model, and
+    // never containing the raw marker.
+    expect(h.engineSendText).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text:
+          'Listo, agendé la llamada para el lunes 13 de julio a las 10:00. ' +
+          'Te envié la invitación a juan@example.com.\nhttps://meet.google.com/abc',
+      }),
+    )
+    // A confirmation is not a reply: it must not spend a cap slot.
+    expect(h.state.rpcCalls).toEqual([])
+  })
+
+  it('never lets the raw marker reach the customer', async () => {
+    h.bookMeeting.mockResolvedValue({
+      status: 'booked',
+      slot: SLOTS[0],
+      result: { eventId: 'evt-1', meetUrl: null },
+    })
+    await dispatchInboundToAiReply(ARGS)
+    const sent = h.engineSendText.mock.calls.at(-1)![0].text as string
+    expect(sent).not.toContain('[[BOOK')
+  })
+
+  it('hands off when the model invents a booking with no calendar', async () => {
+    h.loadCalendarConfig.mockResolvedValue(null)
+    await dispatchInboundToAiReply(ARGS)
+    expect(h.bookMeeting).not.toHaveBeenCalled()
+    expect(h.state.updatePayload).toEqual({ ai_autoreply_disabled: true })
+  })
+
+  it('hands off on a malformed marker instead of guessing', async () => {
+    h.generateReply.mockResolvedValue({
+      text: '[[BOOK|el lunes a las 10|juan@example.com]]',
+      handoff: false,
+    })
+    await dispatchInboundToAiReply(ARGS)
+    expect(h.bookMeeting).not.toHaveBeenCalled()
+    expect(h.state.updatePayload).toEqual({ ai_autoreply_disabled: true })
+  })
+
+  it('hands off when the slot is gone, rather than booking something else', async () => {
+    h.bookMeeting.mockResolvedValue({ status: 'unavailable' })
+    await dispatchInboundToAiReply(ARGS)
+    expect(h.state.updatePayload).toEqual({ ai_autoreply_disabled: true })
+    expect(h.engineSendText).not.toHaveBeenCalledWith(
+      expect.objectContaining({ text: expect.stringContaining('agendé') }),
+    )
+  })
+
+  it('hands off when another conversation claimed the slot', async () => {
+    h.bookMeeting.mockResolvedValue({ status: 'already_claimed' })
+    await dispatchInboundToAiReply(ARGS)
+    expect(h.state.updatePayload).toEqual({ ai_autoreply_disabled: true })
+  })
+
+  it('hands off when Google refuses', async () => {
+    h.bookMeeting.mockResolvedValue({ status: 'failed', error: new Error('403') })
+    await dispatchInboundToAiReply(ARGS)
+    expect(h.state.updatePayload).toEqual({ ai_autoreply_disabled: true })
+  })
+
+  it('prefers a handoff over a booking when the model asks for both', async () => {
+    h.generateReply.mockResolvedValue({ text: MARKER, handoff: true })
+    await dispatchInboundToAiReply(ARGS)
+    expect(h.bookMeeting).not.toHaveBeenCalled()
+    expect(h.state.updatePayload).toEqual({ ai_autoreply_disabled: true })
   })
 })
