@@ -2,10 +2,11 @@ import { NextResponse } from 'next/server'
 import { requireRole, toErrorResponse } from '@/lib/auth/account'
 import { checkRateLimit, rateLimitResponse, RATE_LIMITS } from '@/lib/rate-limit'
 import { loadAiConfig } from '@/lib/ai/config'
+import { containsMonetaryAmount } from '@/lib/ai/guards'
 import { retrieveKnowledge } from '@/lib/ai/knowledge'
 import { generateReply } from '@/lib/ai/generate'
-import { buildSystemPrompt } from '@/lib/ai/defaults'
-import { latestUserMessage } from '@/lib/ai/query'
+import { aiBlockMonetaryReplies, buildSystemPrompt } from '@/lib/ai/defaults'
+import { latestUserMessage, recentUserMessages } from '@/lib/ai/query'
 import { AiError, type ChatMessage } from '@/lib/ai/types'
 
 // Keep the tested transcript bounded, mirroring the live context window.
@@ -72,19 +73,26 @@ export async function POST(request: Request) {
       )
     }
 
-    const knowledge = await retrieveKnowledge(
-      supabase,
-      accountId,
-      config,
-      latestUserMessage(messages),
-    )
+    const knowledge = await retrieveKnowledge(supabase, accountId, config, {
+      semantic: recentUserMessages(messages),
+      lexical: latestUserMessage(messages),
+    })
     const systemPrompt = buildSystemPrompt({
       userPrompt: config.systemPrompt,
       mode: 'auto_reply',
-      knowledge,
+      knowledge: knowledge.excerpts,
+      knowledgeMissing:
+        knowledge.hasKnowledgeBase && knowledge.excerpts.length === 0,
     })
 
     const { text, handoff } = await generateReply({ config, systemPrompt, messages })
+
+    // The live bot discards a reply that quotes money and hands off. Mirror
+    // that here, or the Playground would show the admin an answer their
+    // customers can never receive.
+    if (!handoff && text && aiBlockMonetaryReplies() && containsMonetaryAmount(text)) {
+      return NextResponse.json({ reply: '', handoff: true })
+    }
     return NextResponse.json({ reply: text, handoff })
   } catch (err) {
     if (err instanceof AiError) {

@@ -1,10 +1,13 @@
+import type { SupabaseClient } from '@supabase/supabase-js'
 import { supabaseAdmin } from './admin-client'
 import { loadAiConfig } from './config'
 import { buildConversationContext } from './context'
+import { containsMonetaryAmount } from './guards'
 import { retrieveKnowledge } from './knowledge'
+import { hasUnreadableCustomerBurst } from './media'
 import { generateReply } from './generate'
-import { buildSystemPrompt } from './defaults'
-import { latestUserMessage } from './query'
+import { aiBlockMonetaryReplies, buildSystemPrompt } from './defaults'
+import { latestUserMessage, recentUserMessages } from './query'
 import { engineSendText } from '@/lib/flows/meta-send'
 
 interface DispatchArgs {
@@ -15,6 +18,22 @@ interface DispatchArgs {
   /** The account's WhatsApp config owner, used for the outbound send's
    *  audit columns (mirrors how the flow runner passes it through). */
   configOwnerUserId: string
+}
+
+/**
+ * Stop auto-replying on this thread and leave the inbound unanswered so
+ * it surfaces in the inbox for a human. Sticky until an admin re-enables.
+ */
+async function handOffToHuman(
+  db: SupabaseClient,
+  conversationId: string,
+  reason: string,
+): Promise<void> {
+  console.info(`[ai auto-reply] handing off ${conversationId}: ${reason}`)
+  await db
+    .from('conversations')
+    .update({ ai_autoreply_disabled: true })
+    .eq('id', conversationId)
 }
 
 /**
@@ -31,6 +50,15 @@ interface DispatchArgs {
  *   - auto-reply was disabled for this conversation (prior handoff)
  *   - the per-conversation reply cap is reached
  *   - there's nothing to reply to
+ *
+ * Safety gates that hand off instead (sticky — a human must look):
+ *   - the customer's unanswered burst contains media the model can't read
+ *   - the model asked to hand off, or produced nothing
+ *   - the reply quotes money and the account forbids that
+ *
+ * And one that skips without disabling, because it's an outage rather
+ * than a decision: knowledge retrieval broke, so we cannot tell whether
+ * the reply would be grounded.
  *
  * The 24h WhatsApp session window is inherently open here — we're
  * reacting to a customer message that just landed — so no separate
@@ -79,18 +107,39 @@ export async function dispatchInboundToAiReply(
     const messages = await buildConversationContext(db, conversationId)
     if (messages.length === 0) return
 
-    // Ground the reply in the account's knowledge base (best-effort).
-    const knowledge = await retrieveKnowledge(
-      db,
-      accountId,
-      config,
-      latestUserMessage(messages),
-    )
+    // The model is text-only. If the customer's unanswered burst carries
+    // an image / audio / document, the transcript we just built has a
+    // hole in it and any confident answer is a guess.
+    if (await hasUnreadableCustomerBurst(db, conversationId)) {
+      await handOffToHuman(db, conversationId, 'unreadable media in burst')
+      return
+    }
+
+    // Ground the reply in the account's knowledge base.
+    const knowledge = await retrieveKnowledge(db, accountId, config, {
+      semantic: recentUserMessages(messages),
+      lexical: latestUserMessage(messages),
+    })
+
+    // Retrieval broke (embeddings timeout, RPC error). We don't know what
+    // the KB would have said, so an unsupervised reply here is exactly the
+    // ungrounded guess we're trying to prevent. Skip without disabling —
+    // this is transient, and the next inbound deserves a fresh try.
+    if (knowledge.degraded) {
+      console.error(
+        `[ai auto-reply] knowledge retrieval degraded for conversation ${conversationId}; declining to answer ungrounded.`,
+      )
+      return
+    }
 
     const systemPrompt = buildSystemPrompt({
       userPrompt: config.systemPrompt,
       mode: 'auto_reply',
-      knowledge,
+      knowledge: knowledge.excerpts,
+      // A KB exists but nothing matched: tell the model it's flying blind
+      // so it hands off on business questions instead of improvising.
+      knowledgeMissing:
+        knowledge.hasKnowledgeBase && knowledge.excerpts.length === 0,
     })
 
     const { text, handoff } = await generateReply({
@@ -100,13 +149,15 @@ export async function dispatchInboundToAiReply(
     })
 
     if (handoff || !text) {
-      // The model can't (or shouldn't) answer — stop auto-replying on
-      // this thread and leave the inbound unanswered so it surfaces in
-      // the inbox for a human. Sticky until an admin re-enables.
-      await db
-        .from('conversations')
-        .update({ ai_autoreply_disabled: true })
-        .eq('id', conversationId)
+      // The model can't (or shouldn't) answer.
+      await handOffToHuman(db, conversationId, 'model requested handoff')
+      return
+    }
+
+    // Hard policy check on the generated text. The prompt already asks the
+    // model not to quote prices; this is what makes it true.
+    if (aiBlockMonetaryReplies() && containsMonetaryAmount(text)) {
+      await handOffToHuman(db, conversationId, 'reply quoted a monetary amount')
       return
     }
 

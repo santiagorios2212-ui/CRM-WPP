@@ -1,5 +1,5 @@
 import { AiError, type AiConfig, type ChatMessage, type GenerateResult } from './types'
-import { HANDOFF_SENTINEL, aiRequestTimeoutMs } from './defaults'
+import { HANDOFF_SENTINEL, aiRequestTimeoutMs, aiTemperature } from './defaults'
 import { generateOpenAi } from './providers/openai'
 import { generateAnthropic } from './providers/anthropic'
 
@@ -25,6 +25,7 @@ export async function generateReply(args: GenerateArgs): Promise<GenerateResult>
     systemPrompt,
     messages,
     timeoutMs,
+    temperature: aiTemperature(),
   }
 
   let raw: string
