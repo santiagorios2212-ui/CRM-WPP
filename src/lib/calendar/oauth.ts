@@ -1,3 +1,4 @@
+import { appOrigin } from '@/lib/auth/origin'
 import { GOOGLE_SCOPES } from './google'
 
 // ============================================================
@@ -31,16 +32,7 @@ export const STATE_TTL_SECONDS = 600
  * forged origin fails the handshake instead of leaking a code.
  */
 export function googleRedirectUri(request: Request): string {
-  const explicit = process.env.NEXT_PUBLIC_SITE_URL?.trim()
-  if (explicit) return `${explicit.replace(/\/+$/, '')}/api/calendar/google/callback`
-
-  const headers = request.headers
-  const host = headers.get('x-forwarded-host')?.split(',')[0].trim() ?? headers.get('host')
-  const proto =
-    headers.get('x-forwarded-proto')?.split(',')[0].trim() ??
-    (host?.startsWith('localhost') ? 'http' : 'https')
-
-  return `${proto}://${host}/api/calendar/google/callback`
+  return `${appOrigin(request)}/api/calendar/google/callback`
 }
 
 /**
