@@ -1,5 +1,6 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { supabaseAdmin } from './admin-client'
+import { looksLikeBooking, parseBooking } from './booking'
 import { loadAiConfig } from './config'
 import { buildConversationContext } from './context'
 import { containsMonetaryAmount } from './guards'
@@ -8,10 +9,16 @@ import { hasUnreadableCustomerBurst } from './media'
 import { generateReply } from './generate'
 import {
   aiBlockMonetaryReplies,
+  aiDefaultTimezone,
   aiHandoffMessage,
   buildSystemPrompt,
+  type BookingContext,
 } from './defaults'
 import { latestUserMessage, recentUserMessages } from './query'
+import { freeSlots, suggestedSlots } from '@/lib/calendar/availability'
+import { bookMeeting, confirmationMessage } from '@/lib/calendar/book'
+import { loadCalendarConfig, loadConfirmationTemplate } from '@/lib/calendar/config'
+import type { CalendarConfig } from '@/lib/calendar/types'
 import { engineSendText } from '@/lib/flows/meta-send'
 
 interface DispatchArgs {
@@ -85,6 +92,173 @@ async function handOffToHuman(
   }
 }
 
+interface BookingState {
+  /** Non-null only when the agent may actually write to the calendar. */
+  calendar: CalendarConfig | null
+  /** What the prompt is told about scheduling. See `BookingContext`. */
+  context: BookingContext | null
+  /** The zone the agent reads the clock in — from the calendar when one
+   *  is configured at all, even if booking is switched off. */
+  timezone: string
+}
+
+const NO_BOOKING = (timezone: string): BookingState => ({
+  calendar: null,
+  context: null,
+  timezone,
+})
+
+/**
+ * Decide what the agent may say about scheduling on this turn.
+ *
+ * Every failure collapses to "no calendar", which the prompt turns into
+ * "I cannot book; a human will arrange it" plus a handoff. That is the
+ * only safe direction: an agent that cannot see the diary must not offer
+ * a time, and one that cannot write to it must not promise an invitation.
+ *
+ * A conversation that has already booked gets `null` too. The unique
+ * index on `ai_bookings.conversation_id` would refuse a second event
+ * anyway; telling the model up front means it says something sensible
+ * instead of emitting a marker we then have to reject.
+ */
+async function resolveBooking(
+  db: SupabaseClient,
+  accountId: string,
+  conversationId: string,
+): Promise<BookingState> {
+  const calendar = await loadCalendarConfig(db, accountId)
+  if (!calendar) return NO_BOOKING(aiDefaultTimezone())
+  // Past this point the account has a calendar, so its timezone is the
+  // right one to date the conversation in even when booking is off.
+  if (!calendar.bookingEnabled) return NO_BOOKING(calendar.timezone)
+
+  const { data: existing, error } = await db
+    .from('ai_bookings')
+    .select('id')
+    .eq('conversation_id', conversationId)
+    .maybeSingle()
+  if (error) {
+    console.error('[ai auto-reply] could not check for an existing booking:', error)
+    return NO_BOOKING(calendar.timezone)
+  }
+  if (existing) return NO_BOOKING(calendar.timezone)
+
+  try {
+    const slots = await freeSlots(calendar, new Date())
+    return {
+      calendar,
+      context: {
+        suggested: suggestedSlots(slots, calendar),
+        more: slots.length > calendar.offerSlots,
+      },
+      timezone: calendar.timezone,
+    }
+  } catch (err) {
+    // Google is down, the token was revoked, the calendar was deleted.
+    // Transient or not, we cannot see availability, so we do not schedule.
+    console.error('[ai auto-reply] could not read calendar availability:', err)
+    return NO_BOOKING(calendar.timezone)
+  }
+}
+
+/**
+ * Execute a booking marker the model emitted, and tell the customer.
+ *
+ * Returns true when the turn is finished — either the meeting exists and
+ * the customer has been told, or the thread has been handed off. The
+ * caller sends nothing further either way: the model was instructed to
+ * emit the marker *alone*, so there is no reply text worth salvaging.
+ *
+ * The confirmation deliberately does not consume a `claim_ai_reply_slot`
+ * cap slot, for the same reason the handoff notice does not: it can be
+ * sent at most once per thread (the unique index on `conversation_id`
+ * guarantees it), so it cannot loop, and a customer who has just been
+ * booked should not be met with silence because the cap ran out.
+ */
+async function executeBooking(
+  db: SupabaseClient,
+  args: DispatchArgs,
+  booking: BookingState,
+  text: string,
+): Promise<void> {
+  const { accountId, conversationId, contactId, configOwnerUserId } = args
+
+  if (!booking.calendar) {
+    // The model invented the capability. The prompt told it not to.
+    await handOffToHuman(db, args, 'booking marker emitted with no bookable calendar')
+    return
+  }
+
+  const request = parseBooking(text)
+  if (!request) {
+    await handOffToHuman(db, args, 'malformed booking marker')
+    return
+  }
+
+  const { data: contact } = await db
+    .from('contacts')
+    .select('name')
+    .eq('id', contactId)
+    .maybeSingle()
+
+  const outcome = await bookMeeting({
+    db,
+    config: booking.calendar,
+    accountId,
+    conversationId,
+    contactId,
+    instant: request.instant,
+    attendeeEmail: request.email,
+    contactName: (contact as { name: string | null } | null)?.name,
+  })
+
+  if (outcome.status !== 'booked') {
+    const reason =
+      outcome.status === 'unavailable'
+        ? `slot ${request.iso} is not bookable (taken, or never offered)`
+        : outcome.status === 'already_claimed'
+          ? `slot ${request.iso} was claimed by another conversation`
+          : `booking failed: ${String(outcome.error)}`
+    await handOffToHuman(db, args, reason)
+    return
+  }
+
+  const template = await loadConfirmationTemplate(db, accountId)
+  if (!template) {
+    // The event exists. Staying silent now would be the worst outcome of
+    // all, so hand off — a human will see the thread and the calendar.
+    await handOffToHuman(db, args, 'booked, but no confirmation template configured')
+    return
+  }
+
+  const message = confirmationMessage({
+    template,
+    start: outcome.slot.start,
+    timezone: booking.calendar.timezone,
+    email: request.email,
+    meetUrl: outcome.result.meetUrl,
+  })
+
+  try {
+    await engineSendText({
+      accountId,
+      userId: configOwnerUserId,
+      conversationId,
+      contactId,
+      text: message,
+    })
+    console.info(
+      `[ai auto-reply] booked ${outcome.result.eventId} for ${conversationId} at ${request.iso}`,
+    )
+  } catch (err) {
+    // The meeting is real and the customer has Google's invitation email;
+    // only our WhatsApp confirmation was lost. Hand off rather than retry,
+    // so a human closes the loop instead of a second event being created.
+    console.error('[ai auto-reply] booked but the confirmation failed to send:', err)
+    await handOffToHuman(db, args, 'booked, but the WhatsApp confirmation failed to send')
+  }
+}
+
 /**
  * AI auto-reply for a freshly-arrived inbound message.
  *
@@ -104,6 +278,7 @@ async function handOffToHuman(
  *   - the customer's unanswered burst contains media the model can't read
  *   - the model asked to hand off, or produced nothing
  *   - the reply quotes money and the account forbids that
+ *   - the model tried to book a meeting it could not, or would not, book
  *
  * And one that skips without disabling, because it's an outage rather
  * than a decision: knowledge retrieval broke, so we cannot tell whether
@@ -181,14 +356,20 @@ export async function dispatchInboundToAiReply(
       return
     }
 
+    // What the agent may say about scheduling, and which clock it reads.
+    const booking = await resolveBooking(db, accountId, conversationId)
+
     const systemPrompt = buildSystemPrompt({
       userPrompt: config.systemPrompt,
       mode: 'auto_reply',
+      now: new Date(),
+      timezone: booking.timezone,
       knowledge: knowledge.excerpts,
       // A KB exists but nothing matched: tell the model it's flying blind
       // so it hands off on business questions instead of improvising.
       knowledgeMissing:
         knowledge.hasKnowledgeBase && knowledge.excerpts.length === 0,
+      booking: booking.context,
     })
 
     const { text, handoff } = await generateReply({
@@ -198,8 +379,18 @@ export async function dispatchInboundToAiReply(
     })
 
     if (handoff || !text) {
-      // The model can't (or shouldn't) answer.
+      // The model can't (or shouldn't) answer. Checked before the booking
+      // marker: a reply carrying both is a model contradicting itself, and
+      // the cautious reading wins.
       await handOffToHuman(db, args, 'model requested handoff')
+      return
+    }
+
+    // The model asked to book. `executeBooking` owns the rest of the turn,
+    // including the customer-facing confirmation — which is composed from
+    // the instant we wrote to the calendar, never from `text`.
+    if (looksLikeBooking(text)) {
+      await executeBooking(db, args, booking, text)
       return
     }
 
