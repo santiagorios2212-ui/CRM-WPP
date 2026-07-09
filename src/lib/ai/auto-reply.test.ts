@@ -13,6 +13,8 @@ const h = vi.hoisted(() => ({
     conv: null as Record<string, unknown> | null,
     autoResponders: [] as { id: string }[],
     claim: true as boolean,
+    /** Whether the conditional `ai_autoreply_disabled` flip matched a row. */
+    handoffClaim: true as boolean,
     updatePayload: null as Record<string, unknown> | null,
     rpcCalls: [] as { name: string; args: unknown }[],
   },
@@ -48,9 +50,20 @@ vi.mock('./admin-client', () => ({
               Promise.resolve({ data: h.state.conv, error: null }),
           }),
         }),
+        // .update().eq(id).eq(ai_autoreply_disabled,false).select().maybeSingle()
+        // — the conditional flip that claims the handoff.
         update: (payload: Record<string, unknown>) => {
           h.state.updatePayload = payload
-          return { eq: () => Promise.resolve({ error: null }) }
+          const chain = {
+            eq: () => chain,
+            select: () => chain,
+            maybeSingle: () =>
+              Promise.resolve({
+                data: h.state.handoffClaim ? { id: 'conv-1' } : null,
+                error: null,
+              }),
+          }
+          return chain
         },
       }
     },
@@ -95,6 +108,7 @@ beforeEach(() => {
   }
   h.state.autoResponders = []
   h.state.claim = true
+  h.state.handoffClaim = true
   h.state.updatePayload = null
   h.state.rpcCalls = []
   h.loadAiConfig.mockResolvedValue(aiConfig())
@@ -254,6 +268,79 @@ describe('dispatchInboundToAiReply — handoff', () => {
   })
 })
 
+describe('dispatchInboundToAiReply — handoff notice', () => {
+  const NOTICE = 'Dejame consultarlo con el equipo y te responden en un rato.'
+
+  it('is silent by default, preserving the historical behaviour', async () => {
+    h.generateReply.mockResolvedValue({ text: '', handoff: true })
+    await dispatchInboundToAiReply(ARGS)
+    expect(h.engineSendText).not.toHaveBeenCalled()
+  })
+
+  it('tells the customer when AI_HANDOFF_MESSAGE is set', async () => {
+    vi.stubEnv('AI_HANDOFF_MESSAGE', NOTICE)
+    h.generateReply.mockResolvedValue({ text: '', handoff: true })
+    await dispatchInboundToAiReply(ARGS)
+    expect(h.engineSendText).toHaveBeenCalledWith(
+      expect.objectContaining({ conversationId: 'conv-1', text: NOTICE }),
+    )
+    expect(h.state.updatePayload).toEqual({ ai_autoreply_disabled: true })
+  })
+
+  it('does not spend a reply-cap slot on the notice', async () => {
+    vi.stubEnv('AI_HANDOFF_MESSAGE', NOTICE)
+    h.generateReply.mockResolvedValue({ text: '', handoff: true })
+    await dispatchInboundToAiReply(ARGS)
+    expect(h.state.rpcCalls).toHaveLength(0)
+  })
+
+  it('sends nothing when another inbound already claimed the handoff', async () => {
+    vi.stubEnv('AI_HANDOFF_MESSAGE', NOTICE)
+    h.state.handoffClaim = false // the conditional UPDATE matched no row
+    h.generateReply.mockResolvedValue({ text: '', handoff: true })
+    await dispatchInboundToAiReply(ARGS)
+    expect(h.engineSendText).not.toHaveBeenCalled()
+  })
+
+  it('also notices on the media and monetary handoffs', async () => {
+    vi.stubEnv('AI_HANDOFF_MESSAGE', NOTICE)
+    h.hasUnreadableCustomerBurst.mockResolvedValue(true)
+    await dispatchInboundToAiReply(ARGS)
+    expect(h.engineSendText).toHaveBeenCalledWith(
+      expect.objectContaining({ text: NOTICE }),
+    )
+
+    h.engineSendText.mockClear()
+    h.hasUnreadableCustomerBurst.mockResolvedValue(false)
+    vi.stubEnv('AI_BLOCK_MONETARY_REPLIES', 'true')
+    h.generateReply.mockResolvedValue({ text: 'Sale $80.000.', handoff: false })
+    await dispatchInboundToAiReply(ARGS)
+    expect(h.engineSendText).toHaveBeenCalledWith(
+      expect.objectContaining({ text: NOTICE }),
+    )
+  })
+
+  it('keeps the thread disabled when the notice fails to send', async () => {
+    vi.stubEnv('AI_HANDOFF_MESSAGE', NOTICE)
+    h.engineSendText.mockRejectedValue(new Error('meta 500'))
+    h.generateReply.mockResolvedValue({ text: '', handoff: true })
+    await dispatchInboundToAiReply(ARGS)
+    expect(h.state.updatePayload).toEqual({ ai_autoreply_disabled: true })
+  })
+
+  it('sends no notice on a degraded-retrieval skip (not a handoff)', async () => {
+    vi.stubEnv('AI_HANDOFF_MESSAGE', NOTICE)
+    h.retrieveKnowledge.mockResolvedValue({
+      excerpts: [],
+      hasKnowledgeBase: true,
+      degraded: true,
+    })
+    await dispatchInboundToAiReply(ARGS)
+    expect(h.engineSendText).not.toHaveBeenCalled()
+    expect(h.state.updatePayload).toBeNull()
+  })
+})
+
 describe('dispatchInboundToAiReply — knowledge grounding', () => {
   it('tells the model when a KB exists but nothing matched', async () => {
     h.retrieveKnowledge.mockResolvedValue({
@@ -263,7 +350,7 @@ describe('dispatchInboundToAiReply — knowledge grounding', () => {
     })
     await dispatchInboundToAiReply(ARGS)
     const systemPrompt = h.generateReply.mock.calls[0][0].systemPrompt as string
-    expect(systemPrompt).toContain('NO excerpt matched this question')
+    expect(systemPrompt).toContain('no excerpt matched this question')
     // A greeting must still get a reply — the instruction is scoped to
     // business questions, not enforced as a blanket handoff.
     expect(h.engineSendText).toHaveBeenCalled()
@@ -272,7 +359,7 @@ describe('dispatchInboundToAiReply — knowledge grounding', () => {
   it('says nothing about a knowledge base when the account has none', async () => {
     await dispatchInboundToAiReply(ARGS)
     const systemPrompt = h.generateReply.mock.calls[0][0].systemPrompt as string
-    expect(systemPrompt).not.toContain('NO excerpt matched this question')
+    expect(systemPrompt).not.toContain('no excerpt matched this question')
   })
 })
 
