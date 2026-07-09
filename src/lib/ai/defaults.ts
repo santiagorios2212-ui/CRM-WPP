@@ -150,9 +150,17 @@ export interface PromptSlot {
  */
 export interface BookingContext {
   suggested: PromptSlot[]
-  /** True when bookable slots exist beyond the suggested ones, so the
-   *  agent may accept a time the customer proposes instead. */
-  more: boolean
+  /**
+   * How many slots are bookable in total, of which `suggested` holds only
+   * the soonest few.
+   *
+   * The model must be told the difference. Shown three Friday slots and
+   * nothing else, it told a customer that "el lunes no está disponible" —
+   * Monday was free; it simply wasn't in the list. A short list is a
+   * readable WhatsApp message, not a statement about the diary, and
+   * without the count the model has no way to know that.
+   */
+  total: number
 }
 
 /**
@@ -188,17 +196,21 @@ function buildBookingRules(booking: BookingContext | null | undefined): string {
   }
 
   const list = booking.suggested.map((s) => `- ${s.label} → ${s.iso}`).join('\n')
+  const hidden = booking.total - booking.suggested.length
 
   return (
-    'Scheduling: you can book a meeting in the business calendar. These times are free right now:\n' +
+    'Scheduling: you can book a meeting in the business calendar. ' +
+    (hidden > 0
+      ? `There are ${booking.total} free slots in the booking window. Here are the ${booking.suggested.length} soonest:\n`
+      : 'These are the only free slots left in the booking window:\n') +
     `${list}\n\n` +
     'Propose one or two of them, in the customer\'s language, using the human wording — never the raw timestamp, which is for you alone. ' +
     'Suggest; do not interrogate. A customer who says "de lunes a viernes de 9 a 17" has told you enough: offer them a specific time from the list. Asking them to narrow it down further, when you are holding the availability and they are not, wastes their turn and reads as evasion.\n\n' +
-    (booking.more
-      ? 'Other times outside this list may also be free. If the customer proposes one, go ahead and try to book it — an unavailable time will be caught and you will not be blamed for offering it.\n\n'
-      : 'These are the only free times. If the customer asks for another, say so plainly and offer the closest one listed.\n\n') +
+    (hidden > 0
+      ? `The list above is the soonest few, not the whole diary — ${hidden} other free slots are not shown, and you cannot see which. So never tell the customer that a day or a time is unavailable, unavailable that week, or already taken: you do not know that, and saying it turns a free slot into a lost customer. If they want a time that is not listed, say you can try it, and emit the booking marker for the exact time they named. An unavailable time is caught before anything is written, and you will not be blamed for trying.\n\n`
+      : 'This is the entire remaining diary, so you may say plainly that nothing else is free. If the customer asks for another time, tell them it is taken and offer the closest one listed.\n\n') +
     'To book you need two things: the customer has agreed to one specific time, and you have their email address. Ask for whichever you are missing — one at a time, and never both after they have already given you one.\n\n' +
-    `Once you have both, reply with exactly ${BOOK_SENTINEL_TEMPLATE} and nothing else: no greeting, no confirmation, no other text. Copy the timestamp character for character from the list above — never reformat it, never adjust it, never invent one. The confirmation message is written and sent for you, so you do not need to say anything.\n\n` +
+    `Once you have both, reply with exactly ${BOOK_SENTINEL_TEMPLATE} and nothing else: no greeting, no confirmation, no other text. Copy the timestamp character for character from the list above — or, for a time the customer named that is not listed, write it in that same format, in the timezone stated above. Never invent a time nobody asked for. The confirmation message is written and sent for you, so you do not need to say anything.\n\n` +
     'Until you emit that marker, nothing has been booked. Do not tell the customer you have scheduled the call, do not say an invitation has been sent, and do not promise to send one. Propose a time, take their email, then emit the marker.'
   )
 }

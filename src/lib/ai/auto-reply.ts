@@ -149,7 +149,7 @@ async function resolveBooking(
       calendar,
       context: {
         suggested: suggestedSlots(slots, calendar),
-        more: slots.length > calendar.offerSlots,
+        total: slots.length,
       },
       timezone: calendar.timezone,
     }

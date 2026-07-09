@@ -52,7 +52,7 @@ async function loadBooking(
       slots,
       context: {
         suggested: suggestedSlots(slots, config),
-        more: slots.length > config.offerSlots,
+        total: slots.length,
       },
     }
   } catch (err) {
