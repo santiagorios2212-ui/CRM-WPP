@@ -30,7 +30,7 @@ export async function GET() {
       // `api_key` is selected only to derive `has_key` — it is stripped
       // out below and never returned to the client.
       .select(
-        'provider, model, system_prompt, is_active, auto_reply_enabled, auto_reply_max_per_conversation, api_key, embeddings_api_key',
+        'provider, model, system_prompt, is_active, auto_reply_enabled, auto_reply_max_per_conversation, auto_reply_reset_minutes, api_key, embeddings_api_key',
       )
       .eq('account_id', accountId)
       .maybeSingle()
@@ -95,6 +95,14 @@ export async function POST(request: Request) {
     if (!Number.isFinite(maxPer)) maxPer = 3
     maxPer = Math.min(20, Math.max(1, Math.floor(maxPer)))
 
+    // Reset window, in minutes: how long after an exchange's first message
+    // the reply budget refills. 0 is meaningful — "never reset", the
+    // lifetime cap — so it is preserved, not floored to a minimum. Bounds
+    // mirror the CHECK in migration 033 (≤ 30 days).
+    let resetMinutes = Number(body.auto_reply_reset_minutes)
+    if (!Number.isFinite(resetMinutes)) resetMinutes = 360
+    resetMinutes = Math.min(43200, Math.max(0, Math.floor(resetMinutes)))
+
     const rawKey = typeof body.api_key === 'string' ? body.api_key.trim() : ''
 
     // Embeddings key (optional, for semantic KB search): a non-empty
@@ -146,6 +154,7 @@ export async function POST(request: Request) {
           isActive,
           autoReplyEnabled,
           autoReplyMaxPerConversation: maxPer,
+          autoReplyResetMinutes: resetMinutes,
           embeddingsApiKey: null,
         })
       } catch (err) {
@@ -185,6 +194,7 @@ export async function POST(request: Request) {
       is_active: isActive,
       auto_reply_enabled: autoReplyEnabled,
       auto_reply_max_per_conversation: maxPer,
+      auto_reply_reset_minutes: resetMinutes,
     }
     if (rawEmbeddingsKey) {
       shared.embeddings_api_key = encrypt(rawEmbeddingsKey)

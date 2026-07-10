@@ -21,6 +21,9 @@ export interface AiConfig {
   isActive: boolean
   autoReplyEnabled: boolean
   autoReplyMaxPerConversation: number
+  /** How long after an exchange's first message the reply budget refills,
+   *  in minutes. 0 = never (lifetime cap). See migration 033. */
+  autoReplyResetMinutes: number
   /** Optional OpenAI-compatible key for embeddings. When set, the
    *  knowledge base is embedded and semantic retrieval turns on; when
    *  null, retrieval falls back to lexical full-text search. */

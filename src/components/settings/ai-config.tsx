@@ -64,6 +64,8 @@ export function AiConfig() {
   const [isActive, setIsActive] = useState(false);
   const [autoReplyEnabled, setAutoReplyEnabled] = useState(false);
   const [maxPerConversation, setMaxPerConversation] = useState(3);
+  // Reset window in minutes; the UI edits it in hours. 0 = never reset.
+  const [resetMinutes, setResetMinutes] = useState(360);
 
   // Guard keyed on the account (not a bare boolean) so an in-place
   // account switch — ownership transfer, multi-account membership —
@@ -88,6 +90,7 @@ export function AiConfig() {
         setIsActive(data.is_active);
         setAutoReplyEnabled(data.auto_reply_enabled);
         setMaxPerConversation(data.auto_reply_max_per_conversation ?? 3);
+        setResetMinutes(data.auto_reply_reset_minutes ?? 360);
         setHasStoredKey(Boolean(data.has_key));
         setApiKey(data.has_key ? MASKED_KEY : '');
         setKeyEdited(false);
@@ -134,6 +137,7 @@ export function AiConfig() {
     is_active: isActive,
     auto_reply_enabled: autoReplyEnabled,
     auto_reply_max_per_conversation: maxPerConversation,
+    auto_reply_reset_minutes: resetMinutes,
   });
 
   const handleTest = async () => {
@@ -426,7 +430,8 @@ export function AiConfig() {
               <div>
                 <Label htmlFor="ai-max">Max auto-replies per conversation</Label>
                 <p className="text-xs text-muted-foreground">
-                  After this many bot replies in one thread, the bot goes quiet.
+                  After this many bot replies in one exchange, the bot goes
+                  quiet.
                 </p>
               </div>
               <Input
@@ -443,6 +448,36 @@ export function AiConfig() {
                 disabled={disabled || !autoReplyEnabled}
                 className="w-20"
               />
+            </div>
+
+            <div className="flex items-center justify-between gap-4">
+              <div>
+                <Label htmlFor="ai-reset">Reset that limit after</Label>
+                <p className="text-xs text-muted-foreground">
+                  The clock starts when the customer sends their first message.
+                  Once this long has passed, the next message starts a new
+                  exchange and the reply limit refills. Set to 0 for no reset.
+                </p>
+              </div>
+              <div className="flex shrink-0 items-center gap-2">
+                <Input
+                  id="ai-reset"
+                  type="number"
+                  min={0}
+                  max={720}
+                  // Stored in minutes, edited in whole hours — the precision
+                  // nobody schedules a cooldown to the minute.
+                  value={Math.round(resetMinutes / 60)}
+                  onChange={(e) =>
+                    setResetMinutes(
+                      Math.min(720, Math.max(0, Number(e.target.value) || 0)) * 60,
+                    )
+                  }
+                  disabled={disabled || !autoReplyEnabled}
+                  className="w-20"
+                />
+                <span className="text-sm text-muted-foreground">hours</span>
+              </div>
             </div>
           </CardContent>
         </Card>

@@ -18,10 +18,6 @@ const h = vi.hoisted(() => ({
     conv: null as Record<string, unknown> | null,
     autoResponders: [] as { id: string }[],
     claim: true as boolean,
-    /** What `ai_reply_window_stale` reports: has the thread gone cold? */
-    windowStale: false as boolean,
-    /** Make the staleness probe fail, to exercise the fail-quiet path. */
-    rpcError: false as boolean,
     /** Whether the conditional `ai_autoreply_disabled` flip matched a row. */
     handoffClaim: true as boolean,
     updatePayload: null as Record<string, unknown> | null,
@@ -117,13 +113,6 @@ vi.mock('./admin-client', () => ({
     },
     rpc: (name: string, args: unknown) => {
       h.state.rpcCalls.push({ name, args })
-      // Two RPCs now, with opposite meanings. Returning `claim` for both
-      // would make the cap test pass by reporting the thread stale.
-      if (name === 'ai_reply_window_stale') {
-        return h.state.rpcError
-          ? Promise.resolve({ data: null, error: { message: 'boom' } })
-          : Promise.resolve({ data: h.state.windowStale, error: null })
-      }
       return Promise.resolve({ data: h.state.claim, error: null })
     },
   }),
@@ -147,6 +136,7 @@ function aiConfig(overrides: Partial<AiConfig> = {}): AiConfig {
     isActive: true,
     autoReplyEnabled: true,
     autoReplyMaxPerConversation: 3,
+    autoReplyResetMinutes: 360,
     embeddingsApiKey: null,
     ...overrides,
   }
@@ -160,11 +150,10 @@ beforeEach(() => {
     assigned_agent_id: null,
     ai_autoreply_disabled: false,
     ai_reply_count: 0,
+    ai_window_started_at: null,
   }
   h.state.autoResponders = []
   h.state.claim = true
-  h.state.windowStale = false
-  h.state.rpcError = false
   h.state.handoffClaim = true
   h.state.updatePayload = null
   h.state.rpcCalls = []
@@ -198,7 +187,7 @@ describe('dispatchInboundToAiReply — eligibility gates', () => {
         args: {
           conversation_id: 'conv-1',
           max_replies: 3,
-          idle_reset_minutes: 360,
+          reset_minutes: 360,
         },
       },
     ])
@@ -207,11 +196,10 @@ describe('dispatchInboundToAiReply — eligibility gates', () => {
     )
   })
 
-  it('does not ask whether the thread is stale until the cap is reached', async () => {
-    // The staleness probe is an extra round trip. Under the cap — which is
-    // almost every inbound — it must not happen.
+  it('passes the account\'s configured reset window to the claim', async () => {
+    h.loadAiConfig.mockResolvedValue(aiConfig({ autoReplyResetMinutes: 120 }))
     await dispatchInboundToAiReply(ARGS)
-    expect(h.state.rpcCalls.map((c) => c.name)).toEqual(['claim_ai_reply_slot'])
+    expect(h.state.rpcCalls[0].args).toMatchObject({ reset_minutes: 120 })
   })
 
   it('grounds the reply in retrieved knowledge', async () => {
@@ -289,52 +277,54 @@ describe('dispatchInboundToAiReply — eligibility gates', () => {
     expect(h.engineSendText).not.toHaveBeenCalled()
   })
 
-  it('skips when the cap is reached and the customer never went away', async () => {
+  it('skips when the cap is reached inside an open window', async () => {
     h.state.conv = {
       assigned_agent_id: null,
       ai_autoreply_disabled: false,
       ai_reply_count: 3,
+      ai_window_started_at: new Date(Date.now() - 60 * 60_000).toISOString(), // 1h ago
     }
-    h.state.windowStale = false
     await dispatchInboundToAiReply(ARGS)
     expect(h.engineSendText).not.toHaveBeenCalled()
-    // And it bailed before spending anything on a completion.
+    // Bailed before paying for a completion or reaching the claim.
     expect(h.generateReply).not.toHaveBeenCalled()
-    expect(h.state.rpcCalls.map((c) => c.name)).toEqual(['ai_reply_window_stale'])
+    expect(h.state.rpcCalls).toEqual([])
   })
 
-  it('answers a capped thread once it has gone quiet long enough', async () => {
+  it('answers a capped thread once its reset window has elapsed', async () => {
     // The cap bounds one exchange, not a customer's lifetime. Someone who
     // comes back the next morning must not meet a bot that used up its
-    // budget in March.
+    // budget yesterday. Window opened 7h ago, reset is 6h → expired.
     h.state.conv = {
       assigned_agent_id: null,
       ai_autoreply_disabled: false,
       ai_reply_count: 3,
+      ai_window_started_at: new Date(Date.now() - 7 * 60 * 60_000).toISOString(),
     }
-    h.state.windowStale = true
     await dispatchInboundToAiReply(ARGS)
     expect(h.engineSendText).toHaveBeenCalledWith(
       expect.objectContaining({ text: 'Hello!' }),
     )
-    // The claim resets the counter; the engine never writes it directly.
-    expect(h.state.rpcCalls.map((c) => c.name)).toEqual([
-      'ai_reply_window_stale',
-      'claim_ai_reply_slot',
-    ])
+    // The claim RPC (not the engine) resets the counter atomically.
+    expect(h.state.rpcCalls.map((c) => c.name)).toEqual(['claim_ai_reply_slot'])
   })
 
-  it('stays quiet when the staleness check itself fails', async () => {
-    // Unknown window state on a capped thread. Answering would risk
-    // resuming a loop the cap exists to stop.
+  it('honours a per-account window: the same age is capped at 6h, open at 12h', async () => {
     h.state.conv = {
       assigned_agent_id: null,
       ai_autoreply_disabled: false,
       ai_reply_count: 3,
+      ai_window_started_at: new Date(Date.now() - 8 * 60 * 60_000).toISOString(), // 8h ago
     }
-    h.state.rpcError = true
+    // Default 6h window: 8h-old window has expired → answers.
     await dispatchInboundToAiReply(ARGS)
-    expect(h.engineSendText).not.toHaveBeenCalled()
+    expect(h.generateReply).toHaveBeenCalled()
+
+    // A 12h window on the same thread has not expired → stays quiet.
+    h.generateReply.mockClear()
+    h.loadAiConfig.mockResolvedValue(aiConfig({ autoReplyResetMinutes: 720 }))
+    await dispatchInboundToAiReply(ARGS)
+    expect(h.generateReply).not.toHaveBeenCalled()
   })
 
   it('skips when there is nothing to reply to', async () => {

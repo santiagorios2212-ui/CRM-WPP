@@ -11,10 +11,10 @@ import {
   aiBlockMonetaryReplies,
   aiDefaultTimezone,
   aiHandoffMessage,
-  aiReplyIdleResetMinutes,
   buildSystemPrompt,
   type BookingContext,
 } from './defaults'
+import { replyWindowExpired } from './reply-window'
 import { latestUserMessage, recentUserMessages } from './query'
 import { freeSlots, suggestedSlots } from '@/lib/calendar/availability'
 import { bookMeeting, confirmationMessage } from '@/lib/calendar/book'
@@ -272,8 +272,8 @@ async function executeBooking(
  *   - AI off / auto-reply disabled for the account
  *   - a human agent is assigned (they own the thread)
  *   - auto-reply was disabled for this conversation (prior handoff)
- *   - the per-conversation reply cap is reached, and the thread has not
- *     been quiet long enough to start a new exchange
+ *   - the per-conversation reply cap is reached and the reset window,
+ *     timed from the exchange's first message, has not yet elapsed
  *   - there's nothing to reply to
  *
  * Safety gates that hand off instead (sticky — a human must look):
@@ -320,7 +320,9 @@ export async function dispatchInboundToAiReply(
 
     const { data: conv, error: convErr } = await db
       .from('conversations')
-      .select('assigned_agent_id, ai_autoreply_disabled, ai_reply_count')
+      .select(
+        'assigned_agent_id, ai_autoreply_disabled, ai_reply_count, ai_window_started_at',
+      )
       .eq('id', conversationId)
       .maybeSingle()
     if (convErr || !conv) return
@@ -328,23 +330,18 @@ export async function dispatchInboundToAiReply(
     if (conv.ai_autoreply_disabled) return // handed off / turned off here
 
     // Cheap early-out, to avoid paying for retrieval and a completion on a
-    // thread that cannot send. The authoritative cap check is the atomic
-    // claim below (this read can race a concurrent inbound).
+    // thread that cannot send. The authoritative check is the atomic claim
+    // below (this read can race a concurrent inbound, and uses the app
+    // clock rather than the database's).
     //
-    // A capped thread is not necessarily a closed one: the cap restarts
-    // after the conversation has been quiet long enough. Asking Postgres
-    // rather than re-deriving the rule here keeps the two in step — the
-    // claim runs the same function.
-    if (conv.ai_reply_count >= config.autoReplyMaxPerConversation) {
-      const { data: stale, error: staleErr } = await db.rpc('ai_reply_window_stale', {
-        p_conversation_id: conversationId,
-        p_idle_minutes: aiReplyIdleResetMinutes(),
-      })
-      if (staleErr) {
-        console.error('[ai auto-reply] ai_reply_window_stale failed:', staleErr)
-        return
-      }
-      if (stale !== true) return // capped, and the customer never left
+    // A capped thread is not necessarily a closed one: the reply budget
+    // refills once the reset window — timed from the exchange's first
+    // message — has elapsed. Only then is it worth continuing.
+    if (
+      conv.ai_reply_count >= config.autoReplyMaxPerConversation &&
+      !replyWindowExpired(conv.ai_window_started_at, config.autoReplyResetMinutes)
+    ) {
+      return
     }
 
     const messages = await buildConversationContext(db, conversationId)
@@ -430,7 +427,7 @@ export async function dispatchInboundToAiReply(
       {
         conversation_id: conversationId,
         max_replies: config.autoReplyMaxPerConversation,
-        idle_reset_minutes: aiReplyIdleResetMinutes(),
+        reset_minutes: config.autoReplyResetMinutes,
       },
     )
     if (claimErr) {
