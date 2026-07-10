@@ -33,6 +33,7 @@ const DEFAULT_CONTEXT_MESSAGE_LIMIT = 20
 const DEFAULT_TEMPERATURE = 0.2
 const DEFAULT_KNOWLEDGE_MAX_DISTANCE = 0.75
 const DEFAULT_RETRIEVAL_USER_TURNS = 3
+const DEFAULT_REPLY_IDLE_RESET_MINUTES = 360 // six hours
 
 /** Per-call provider timeout. Override with `AI_REQUEST_TIMEOUT_MS`. */
 export function aiRequestTimeoutMs(): number {
@@ -91,6 +92,23 @@ export function aiRetrievalUserTurns(): number {
  */
 export function aiBlockMonetaryReplies(): boolean {
   return process.env.AI_BLOCK_MONETARY_REPLIES === 'true'
+}
+
+/**
+ * How long a thread must stay silent before the per-conversation reply
+ * cap starts over. Override with `AI_REPLY_IDLE_RESET_MINUTES`.
+ *
+ * The cap exists to stop a runaway loop inside one exchange, not to
+ * ration a customer for life. Six hours means an overnight gap, or a
+ * lunch break, opens a new exchange with a fresh budget, while a burst
+ * of twenty messages in an afternoon stays under one.
+ *
+ * Measured on the gap between the inbound that just arrived and the
+ * message before it — see `ai_reply_window_stale` in migration 033.
+ */
+export function aiReplyIdleResetMinutes(): number {
+  const raw = Number(process.env.AI_REPLY_IDLE_RESET_MINUTES)
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : DEFAULT_REPLY_IDLE_RESET_MINUTES
 }
 
 /**

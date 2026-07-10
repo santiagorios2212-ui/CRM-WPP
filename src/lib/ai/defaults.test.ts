@@ -4,6 +4,7 @@ import {
   aiBlockMonetaryReplies,
   aiDefaultTimezone,
   aiKnowledgeMaxDistance,
+  aiReplyIdleResetMinutes,
   aiRetrievalUserTurns,
   aiTemperature,
   buildSystemPrompt as build,
@@ -228,6 +229,12 @@ describe('tunables', () => {
     expect(aiRetrievalUserTurns()).toBe(3)
     expect(aiBlockMonetaryReplies()).toBe(false)
     expect(aiDefaultTimezone()).toBe('UTC')
+    expect(aiReplyIdleResetMinutes()).toBe(360)
+
+    vi.stubEnv('AI_REPLY_IDLE_RESET_MINUTES', '0')
+    expect(aiReplyIdleResetMinutes()).toBe(360) // 0 would reset on every turn
+    vi.stubEnv('AI_REPLY_IDLE_RESET_MINUTES', '90')
+    expect(aiReplyIdleResetMinutes()).toBe(90)
 
     vi.stubEnv('AI_TEMPERATURE', 'hot')
     vi.stubEnv('AI_RETRIEVAL_USER_TURNS', '-2')

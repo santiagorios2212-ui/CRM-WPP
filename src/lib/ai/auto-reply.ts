@@ -11,6 +11,7 @@ import {
   aiBlockMonetaryReplies,
   aiDefaultTimezone,
   aiHandoffMessage,
+  aiReplyIdleResetMinutes,
   buildSystemPrompt,
   type BookingContext,
 } from './defaults'
@@ -271,7 +272,8 @@ async function executeBooking(
  *   - AI off / auto-reply disabled for the account
  *   - a human agent is assigned (they own the thread)
  *   - auto-reply was disabled for this conversation (prior handoff)
- *   - the per-conversation reply cap is reached
+ *   - the per-conversation reply cap is reached, and the thread has not
+ *     been quiet long enough to start a new exchange
  *   - there's nothing to reply to
  *
  * Safety gates that hand off instead (sticky — a human must look):
@@ -324,9 +326,26 @@ export async function dispatchInboundToAiReply(
     if (convErr || !conv) return
     if (conv.assigned_agent_id) return // a human owns this thread
     if (conv.ai_autoreply_disabled) return // handed off / turned off here
-    // Cheap early-out; the authoritative cap check is the atomic claim
-    // below (this read can race a concurrent inbound).
-    if (conv.ai_reply_count >= config.autoReplyMaxPerConversation) return
+
+    // Cheap early-out, to avoid paying for retrieval and a completion on a
+    // thread that cannot send. The authoritative cap check is the atomic
+    // claim below (this read can race a concurrent inbound).
+    //
+    // A capped thread is not necessarily a closed one: the cap restarts
+    // after the conversation has been quiet long enough. Asking Postgres
+    // rather than re-deriving the rule here keeps the two in step — the
+    // claim runs the same function.
+    if (conv.ai_reply_count >= config.autoReplyMaxPerConversation) {
+      const { data: stale, error: staleErr } = await db.rpc('ai_reply_window_stale', {
+        p_conversation_id: conversationId,
+        p_idle_minutes: aiReplyIdleResetMinutes(),
+      })
+      if (staleErr) {
+        console.error('[ai auto-reply] ai_reply_window_stale failed:', staleErr)
+        return
+      }
+      if (stale !== true) return // capped, and the customer never left
+    }
 
     const messages = await buildConversationContext(db, conversationId)
     if (messages.length === 0) return
@@ -411,6 +430,7 @@ export async function dispatchInboundToAiReply(
       {
         conversation_id: conversationId,
         max_replies: config.autoReplyMaxPerConversation,
+        idle_reset_minutes: aiReplyIdleResetMinutes(),
       },
     )
     if (claimErr) {

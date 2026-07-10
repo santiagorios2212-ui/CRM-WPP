@@ -18,6 +18,10 @@ const h = vi.hoisted(() => ({
     conv: null as Record<string, unknown> | null,
     autoResponders: [] as { id: string }[],
     claim: true as boolean,
+    /** What `ai_reply_window_stale` reports: has the thread gone cold? */
+    windowStale: false as boolean,
+    /** Make the staleness probe fail, to exercise the fail-quiet path. */
+    rpcError: false as boolean,
     /** Whether the conditional `ai_autoreply_disabled` flip matched a row. */
     handoffClaim: true as boolean,
     updatePayload: null as Record<string, unknown> | null,
@@ -113,6 +117,13 @@ vi.mock('./admin-client', () => ({
     },
     rpc: (name: string, args: unknown) => {
       h.state.rpcCalls.push({ name, args })
+      // Two RPCs now, with opposite meanings. Returning `claim` for both
+      // would make the cap test pass by reporting the thread stale.
+      if (name === 'ai_reply_window_stale') {
+        return h.state.rpcError
+          ? Promise.resolve({ data: null, error: { message: 'boom' } })
+          : Promise.resolve({ data: h.state.windowStale, error: null })
+      }
       return Promise.resolve({ data: h.state.claim, error: null })
     },
   }),
@@ -152,6 +163,8 @@ beforeEach(() => {
   }
   h.state.autoResponders = []
   h.state.claim = true
+  h.state.windowStale = false
+  h.state.rpcError = false
   h.state.handoffClaim = true
   h.state.updatePayload = null
   h.state.rpcCalls = []
@@ -182,12 +195,23 @@ describe('dispatchInboundToAiReply — eligibility gates', () => {
     expect(h.state.rpcCalls).toEqual([
       {
         name: 'claim_ai_reply_slot',
-        args: { conversation_id: 'conv-1', max_replies: 3 },
+        args: {
+          conversation_id: 'conv-1',
+          max_replies: 3,
+          idle_reset_minutes: 360,
+        },
       },
     ])
     expect(h.engineSendText).toHaveBeenCalledWith(
       expect.objectContaining({ conversationId: 'conv-1', text: 'Hello!' }),
     )
+  })
+
+  it('does not ask whether the thread is stale until the cap is reached', async () => {
+    // The staleness probe is an extra round trip. Under the cap — which is
+    // almost every inbound — it must not happen.
+    await dispatchInboundToAiReply(ARGS)
+    expect(h.state.rpcCalls.map((c) => c.name)).toEqual(['claim_ai_reply_slot'])
   })
 
   it('grounds the reply in retrieved knowledge', async () => {
@@ -265,12 +289,50 @@ describe('dispatchInboundToAiReply — eligibility gates', () => {
     expect(h.engineSendText).not.toHaveBeenCalled()
   })
 
-  it('skips when the per-conversation cap is reached', async () => {
+  it('skips when the cap is reached and the customer never went away', async () => {
     h.state.conv = {
       assigned_agent_id: null,
       ai_autoreply_disabled: false,
       ai_reply_count: 3,
     }
+    h.state.windowStale = false
+    await dispatchInboundToAiReply(ARGS)
+    expect(h.engineSendText).not.toHaveBeenCalled()
+    // And it bailed before spending anything on a completion.
+    expect(h.generateReply).not.toHaveBeenCalled()
+    expect(h.state.rpcCalls.map((c) => c.name)).toEqual(['ai_reply_window_stale'])
+  })
+
+  it('answers a capped thread once it has gone quiet long enough', async () => {
+    // The cap bounds one exchange, not a customer's lifetime. Someone who
+    // comes back the next morning must not meet a bot that used up its
+    // budget in March.
+    h.state.conv = {
+      assigned_agent_id: null,
+      ai_autoreply_disabled: false,
+      ai_reply_count: 3,
+    }
+    h.state.windowStale = true
+    await dispatchInboundToAiReply(ARGS)
+    expect(h.engineSendText).toHaveBeenCalledWith(
+      expect.objectContaining({ text: 'Hello!' }),
+    )
+    // The claim resets the counter; the engine never writes it directly.
+    expect(h.state.rpcCalls.map((c) => c.name)).toEqual([
+      'ai_reply_window_stale',
+      'claim_ai_reply_slot',
+    ])
+  })
+
+  it('stays quiet when the staleness check itself fails', async () => {
+    // Unknown window state on a capped thread. Answering would risk
+    // resuming a loop the cap exists to stop.
+    h.state.conv = {
+      assigned_agent_id: null,
+      ai_autoreply_disabled: false,
+      ai_reply_count: 3,
+    }
+    h.state.rpcError = true
     await dispatchInboundToAiReply(ARGS)
     expect(h.engineSendText).not.toHaveBeenCalled()
   })
