@@ -136,6 +136,7 @@ function aiConfig(overrides: Partial<AiConfig> = {}): AiConfig {
     isActive: true,
     autoReplyEnabled: true,
     autoReplyMaxPerConversation: 3,
+    autoReplyResetMinutes: 360,
     embeddingsApiKey: null,
     ...overrides,
   }
@@ -149,6 +150,7 @@ beforeEach(() => {
     assigned_agent_id: null,
     ai_autoreply_disabled: false,
     ai_reply_count: 0,
+    ai_window_started_at: null,
   }
   h.state.autoResponders = []
   h.state.claim = true
@@ -182,12 +184,22 @@ describe('dispatchInboundToAiReply — eligibility gates', () => {
     expect(h.state.rpcCalls).toEqual([
       {
         name: 'claim_ai_reply_slot',
-        args: { conversation_id: 'conv-1', max_replies: 3 },
+        args: {
+          conversation_id: 'conv-1',
+          max_replies: 3,
+          reset_minutes: 360,
+        },
       },
     ])
     expect(h.engineSendText).toHaveBeenCalledWith(
       expect.objectContaining({ conversationId: 'conv-1', text: 'Hello!' }),
     )
+  })
+
+  it('passes the account\'s configured reset window to the claim', async () => {
+    h.loadAiConfig.mockResolvedValue(aiConfig({ autoReplyResetMinutes: 120 }))
+    await dispatchInboundToAiReply(ARGS)
+    expect(h.state.rpcCalls[0].args).toMatchObject({ reset_minutes: 120 })
   })
 
   it('grounds the reply in retrieved knowledge', async () => {
@@ -265,14 +277,54 @@ describe('dispatchInboundToAiReply — eligibility gates', () => {
     expect(h.engineSendText).not.toHaveBeenCalled()
   })
 
-  it('skips when the per-conversation cap is reached', async () => {
+  it('skips when the cap is reached inside an open window', async () => {
     h.state.conv = {
       assigned_agent_id: null,
       ai_autoreply_disabled: false,
       ai_reply_count: 3,
+      ai_window_started_at: new Date(Date.now() - 60 * 60_000).toISOString(), // 1h ago
     }
     await dispatchInboundToAiReply(ARGS)
     expect(h.engineSendText).not.toHaveBeenCalled()
+    // Bailed before paying for a completion or reaching the claim.
+    expect(h.generateReply).not.toHaveBeenCalled()
+    expect(h.state.rpcCalls).toEqual([])
+  })
+
+  it('answers a capped thread once its reset window has elapsed', async () => {
+    // The cap bounds one exchange, not a customer's lifetime. Someone who
+    // comes back the next morning must not meet a bot that used up its
+    // budget yesterday. Window opened 7h ago, reset is 6h → expired.
+    h.state.conv = {
+      assigned_agent_id: null,
+      ai_autoreply_disabled: false,
+      ai_reply_count: 3,
+      ai_window_started_at: new Date(Date.now() - 7 * 60 * 60_000).toISOString(),
+    }
+    await dispatchInboundToAiReply(ARGS)
+    expect(h.engineSendText).toHaveBeenCalledWith(
+      expect.objectContaining({ text: 'Hello!' }),
+    )
+    // The claim RPC (not the engine) resets the counter atomically.
+    expect(h.state.rpcCalls.map((c) => c.name)).toEqual(['claim_ai_reply_slot'])
+  })
+
+  it('honours a per-account window: the same age is capped at 6h, open at 12h', async () => {
+    h.state.conv = {
+      assigned_agent_id: null,
+      ai_autoreply_disabled: false,
+      ai_reply_count: 3,
+      ai_window_started_at: new Date(Date.now() - 8 * 60 * 60_000).toISOString(), // 8h ago
+    }
+    // Default 6h window: 8h-old window has expired → answers.
+    await dispatchInboundToAiReply(ARGS)
+    expect(h.generateReply).toHaveBeenCalled()
+
+    // A 12h window on the same thread has not expired → stays quiet.
+    h.generateReply.mockClear()
+    h.loadAiConfig.mockResolvedValue(aiConfig({ autoReplyResetMinutes: 720 }))
+    await dispatchInboundToAiReply(ARGS)
+    expect(h.generateReply).not.toHaveBeenCalled()
   })
 
   it('skips when there is nothing to reply to', async () => {

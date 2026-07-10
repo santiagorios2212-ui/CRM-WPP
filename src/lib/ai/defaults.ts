@@ -34,6 +34,11 @@ const DEFAULT_TEMPERATURE = 0.2
 const DEFAULT_KNOWLEDGE_MAX_DISTANCE = 0.75
 const DEFAULT_RETRIEVAL_USER_TURNS = 3
 
+/** Default reply-count reset window, in minutes, for accounts that have
+ *  not set one. Six hours. Stored per account on `ai_configs`; see
+ *  migration 033. */
+export const DEFAULT_REPLY_RESET_MINUTES = 360
+
 /** Per-call provider timeout. Override with `AI_REQUEST_TIMEOUT_MS`. */
 export function aiRequestTimeoutMs(): number {
   const raw = Number(process.env.AI_REQUEST_TIMEOUT_MS)
