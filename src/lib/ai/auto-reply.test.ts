@@ -36,7 +36,7 @@ vi.mock('./media', () => ({
 vi.mock('./generate', () => ({ generateReply: h.generateReply }))
 vi.mock('@/lib/flows/meta-send', () => ({ engineSendText: h.engineSendText }))
 
-// Only the IO is stubbed. `suggestedSlots` and `confirmationMessage` are
+// Only the IO is stubbed. `availableSlots` and `confirmationMessage` are
 // pure, and mocking them would hide the thing worth testing: that the
 // customer is told the time we actually wrote to the calendar.
 vi.mock('@/lib/calendar/config', () => ({

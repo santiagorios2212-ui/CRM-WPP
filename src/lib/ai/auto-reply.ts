@@ -16,7 +16,7 @@ import {
 } from './defaults'
 import { replyWindowExpired } from './reply-window'
 import { latestUserMessage, recentUserMessages } from './query'
-import { freeSlots, suggestedSlots } from '@/lib/calendar/availability'
+import { availableSlots, freeSlots } from '@/lib/calendar/availability'
 import { bookMeeting, confirmationMessage } from '@/lib/calendar/book'
 import { loadCalendarConfig, loadConfirmationTemplate } from '@/lib/calendar/config'
 import type { CalendarConfig } from '@/lib/calendar/types'
@@ -149,7 +149,8 @@ async function resolveBooking(
     return {
       calendar,
       context: {
-        suggested: suggestedSlots(slots, calendar),
+        available: availableSlots(slots, calendar),
+        offer: calendar.offerSlots,
         total: slots.length,
       },
       timezone: calendar.timezone,

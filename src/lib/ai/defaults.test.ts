@@ -149,10 +149,11 @@ describe('buildSystemPrompt — the clock', () => {
 
 describe('buildSystemPrompt — scheduling', () => {
   const slots: BookingContext = {
-    suggested: [
+    available: [
       { iso: '2026-07-13T10:00:00-03:00', label: 'lunes 13 de julio a las 10:00' },
       { iso: '2026-07-13T14:00:00-03:00', label: 'lunes 13 de julio a las 14:00' },
     ],
+    offer: 2,
     total: 42,
   }
 
@@ -168,7 +169,7 @@ describe('buildSystemPrompt — scheduling', () => {
     const prompt = buildSystemPrompt({
       userPrompt: null,
       mode: 'auto_reply',
-      booking: { suggested: [], total: 0 },
+      booking: { available: [], offer: 3, total: 0 },
     })
     expect(prompt).toContain('no free slots in the bookable window')
     expect(prompt).toMatch(/do not offer to look for one/i)
@@ -190,28 +191,39 @@ describe('buildSystemPrompt — scheduling', () => {
     expect(prompt).toMatch(/nothing has been booked/i)
   })
 
-  it('forbids claiming a day is unavailable while slots are hidden', () => {
-    // The bug: shown three Friday slots, the agent told a real customer
-    // "el lunes no está disponible". Monday was free — it just wasn't in
-    // the list. A short list is a readable message, not a claim about the
-    // diary, and the model has to be told which.
+  it('answers a requested time from the list instead of hedging', () => {
+    // The bug this was written for: asked for "las 11", the agent replied
+    // "puedo intentar reservar... no te aseguro disponibilidad". The list
+    // already settles it, so the agent must answer, not "try".
     const prompt = buildSystemPrompt({ userPrompt: null, mode: 'auto_reply', booking: slots })
-    expect(prompt).toContain('There are 42 free slots')
-    expect(prompt).toContain('the 2 soonest')
-    expect(prompt).toContain('40 other free slots are not shown')
-    expect(prompt).toMatch(/never tell the customer that a day or a time is unavailable/i)
-    expect(prompt).toMatch(/say you can try it/i)
+    expect(prompt).toContain('check it against the list and answer from it')
+    expect(prompt).toContain('do not say you will "try"')
+    // Taken time → say so and offer the nearest, don't invent unavailability.
+    expect(prompt).toContain('offer the nearest listed time')
   })
 
-  it('permits saying a time is taken only when nothing else is free', () => {
+  it('forbids claiming a later time is taken while slots are hidden', () => {
+    // Shown only the near-term window, the agent must not declare a time
+    // past the end of the list taken — it cannot see that far.
+    const prompt = buildSystemPrompt({ userPrompt: null, mode: 'auto_reply', booking: slots })
+    expect(prompt).toContain('of 42 in total')
+    expect(prompt).toContain('40 later slots exist')
+    expect(prompt).toMatch(/never tell the customer it is taken/i)
+    // And it must never revert to the old "say you can try it" hedge.
+    expect(prompt).not.toMatch(/say you can try/i)
+  })
+
+  it('permits saying a time is taken only when the whole diary is shown', () => {
     const closed = buildSystemPrompt({
       userPrompt: null,
       mode: 'auto_reply',
-      booking: { ...slots, total: slots.suggested.length },
+      booking: { ...slots, total: slots.available.length },
     })
-    expect(closed).toContain('These are the only free slots')
-    expect(closed).toContain('This is the entire remaining diary')
-    expect(closed).not.toMatch(/never tell the customer that a day or a time is unavailable/i)
+    expect(closed).toContain('your complete availability')
+    expect(closed).toContain('entire remaining diary')
+    expect(closed).toContain('genuinely unavailable')
+    // With nothing hidden, there is no "later slots you cannot see" caveat.
+    expect(closed).not.toContain('later slots exist')
   })
 
   it('never teaches a draft to book — a human sends those', () => {

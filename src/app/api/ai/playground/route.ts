@@ -14,7 +14,7 @@ import {
   type BookingContext,
 } from '@/lib/ai/defaults'
 import { latestUserMessage, recentUserMessages } from '@/lib/ai/query'
-import { freeSlots, suggestedSlots } from '@/lib/calendar/availability'
+import { availableSlots, freeSlots } from '@/lib/calendar/availability'
 import { confirmationMessage } from '@/lib/calendar/book'
 import { loadCalendarConfig, loadConfirmationTemplate } from '@/lib/calendar/config'
 import { isBookable } from '@/lib/calendar/slots'
@@ -51,7 +51,8 @@ async function loadBooking(
       config,
       slots,
       context: {
-        suggested: suggestedSlots(slots, config),
+        available: availableSlots(slots, config),
+        offer: config.offerSlots,
         total: slots.length,
       },
     }
