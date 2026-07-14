@@ -32,21 +32,40 @@ export async function freeSlots(config: CalendarConfig, now: Date): Promise<Slot
 
 /** A slot as the model sees it: a human label to say out loud, and the
  *  exact timestamp to echo back in the booking marker. */
-export interface SuggestedSlot {
+export interface PromptSlot {
   iso: string
   label: string
 }
 
 /**
- * The handful of slots to put in front of the customer.
+ * How many free slots to name in the prompt.
  *
- * Only the *presentation* is trimmed to `offerSlots` — a WhatsApp
- * message listing fourteen times is unreadable. The model may still book
- * any slot in the full set, so a customer who counter-proposes "¿y el
- * jueves a las 15?" is not told it is unavailable when it plainly is.
+ * The model both proposes from this list and validates a customer's
+ * requested time against it, so the window has to be wide enough that an
+ * ordinary counter-proposal — "¿y a las 11?", "¿el jueves?" — is almost
+ * always a time it can see and answer definitively, rather than one it has
+ * to hedge about. It is deliberately generous: it comfortably covers the
+ * whole default booking horizon for a normally-busy diary, and only starts
+ * to bite on an unusually open calendar or a horizon of many weeks. Past
+ * it, `total` tells the model there is more availability it cannot see, so
+ * it never mistakes the end of the list for the end of the diary.
  */
-export function suggestedSlots(slots: Slot[], config: CalendarConfig): SuggestedSlot[] {
-  return slots.slice(0, config.offerSlots).map((slot) => ({
+export const MAX_PROMPT_SLOTS = 150
+
+/**
+ * The bookable slots to put in front of the model, soonest first, capped
+ * at `MAX_PROMPT_SLOTS`.
+ *
+ * This is both the list the agent proposes from and the list it checks a
+ * customer's requested time against. Only the *proposal* is trimmed
+ * further — to `config.offerSlots` — and that happens in the prompt, when
+ * the agent writes the actual WhatsApp message; a fourteen-line message is
+ * unreadable, but the model still needs to *see* the wider availability so
+ * it can answer "sí, las 11 está libre" or "las 11 está ocupada, ¿te sirve
+ * a las 11:30?" instead of promising to "try".
+ */
+export function availableSlots(slots: Slot[], config: CalendarConfig): PromptSlot[] {
+  return slots.slice(0, MAX_PROMPT_SLOTS).map((slot) => ({
     iso: isoWithOffset(slot.start, config.timezone),
     label: formatSlotEs(slot.start, config.timezone),
   }))
